@@ -15,8 +15,9 @@
 
 struct MaxSatInstance {
 
-    // raw C array of the formula (hard clauses) to solve
-    const int* formulaData;
+    // std vector of the formula (hard clauses) to solve
+    std::vector<int> formula;
+
     struct ObjectiveTerm {
         size_t factor;
         int lit;
@@ -24,8 +25,6 @@ struct MaxSatInstance {
     int preprocessLayer {0};
     // objective function as a linear combination of literals
     std::vector<ObjectiveTerm> objective;
-    // size of the raw C array _f_data
-    size_t formulaSize;
     // number of variables in the formula - update when adding new ones
     unsigned int nbVars;
     size_t sumOfWeights;
@@ -33,6 +32,7 @@ struct MaxSatInstance {
 
     size_t lowerBound;
     size_t upperBound;
+    size_t encodedCost;
 
     // the best found satisfying assignment so far
     std::vector<int> bestSolution;
@@ -42,7 +42,7 @@ struct MaxSatInstance {
 
     std::unique_ptr<IntervalSearch> intervalSearch;
 
-    MaxSatInstance(const int* formulaData, size_t formulaSize) : formulaData(formulaData), formulaSize(formulaSize) {}
+    MaxSatInstance(const int* formulaData, size_t formulaSize) : formula(formulaData, formulaData + formulaSize) {}
     MaxSatInstance(JobDescription& _desc, bool fromMaxPre, float intervalSkew) {
 
         // Fetch serialized WCNF description
@@ -66,8 +66,7 @@ struct MaxSatInstance {
         assert(fPtr[pos] == 0);
         // pos now points at the separation zero right before the objective
         // hard clauses end at the separation zero to the objective
-        formulaData = fPtr;
-        formulaSize = pos;
+        formula = std::vector<int>(fPtr, fPtr + pos);
         lowerBound = lb;
         upperBound = ub;
 
@@ -108,7 +107,7 @@ struct MaxSatInstance {
     // Print some nice-to-know diagnostics.
     void print(int updateLayer = 0) const {
         LOG(V2_INFO, "MAXSAT instance layer=%i lits=%lu #o=%lu sow=%lu #uniq=%lu lb=%lu ub=%lu\n",
-            updateLayer, formulaSize, objective.size(), sumOfWeights, nbUniqueWeights, lowerBound, upperBound);
+            updateLayer, formula.size(), objective.size(), sumOfWeights, nbUniqueWeights, lowerBound, upperBound);
         std::string o;
         for (size_t i = 0; i < objective.size(); i++) {
 

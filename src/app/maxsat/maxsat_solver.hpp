@@ -5,6 +5,7 @@
 #include "app/maxsat/maxsat_search_procedure.hpp"
 #include "app/maxsat/parse/maxsat_reader.hpp"
 #include "app/maxsat/solution_writer.hpp"
+#include "app/maxsat/core_guided_search.hpp"
 #include "app/sat/data/definitions.hpp"
 #include "app/sat/job/sat_constants.h"
 #include "comm/mympi.hpp"
@@ -16,6 +17,7 @@
 #include <climits>
 #include <list>
 #include <memory>
+#include <chrono>
 #include <unistd.h>
 #include "robin_set.h"
 #include "util/logger.hpp"
@@ -106,9 +108,9 @@ public:
 
     // Perform exact MaxSAT solving and return an according result.
     JobResult solve(int updateLayer = 0) {
-
+        _instance->encodedCost = 0;
         // holds all active streams of Mallob jobs and allows interacting with them
-        std::list<std::unique_ptr<MaxSatSearchProcedure>> searches;
+        //std::list<std::unique_ptr<MaxSatSearchProcedure>> searches;
         std::shared_ptr<SolutionWriter> writer;
         if (_params.maxSatSolutionFile.isSet())
             writer.reset(new SolutionWriter(_instance->nbVars, _params.maxSatSolutionFile(), _params.compressModels()));
@@ -139,95 +141,238 @@ public:
         }
 #endif
 
-        // Parse the user-provided sequence of search strategies.
-        size_t nbSearchers = std::min((size_t)_params.maxSatNumSearchers(), (_instance->upperBound - _instance->lowerBound) + 1);
-        std::string searchStrats = std::string(nbSearchers, 'd');
-        const int nbWorkers = _params.numWorkers() == -1 ? MyMpi::size(MPI_COMM_WORLD) : _params.numWorkers();
-        // Loop over each specified search strategy
-        for (int i = 0; i < searchStrats.size(); i++) {
-            char c = searchStrats[i];
-            // Check if we have enough workers in the system for another job stream
-            if (nbWorkers <= searches.size()) {
-                LOG(V1_WARN, "MAXSAT [WARN] Truncating number of parallel search strategies to %i due to lack of workers\n",
-                    nbWorkers);
-                break;
+        std::list<std::unique_ptr<MaxSatSearchProcedure>> searches {};
+        std::list<std::unique_ptr<MaxSatInstance>> reformulatedInstances {};
+        std::unique_ptr<CoreGuidedSearch> coreGuided = nullptr;
+        
+        if (_params.maxSatCoreGuided()) {
+            coreGuided = std::make_unique<CoreGuidedSearch>(
+                _params, _api, _desc, _dtask_tracker, *_instance, updateLayer
+            );
+            if (coreGuided->getBestGlobalCost() < ULONG_MAX) {
+                _instance->bestCost = coreGuided->getBestGlobalCost();
+                _instance->bestSolution = coreGuided->getBestGlobalSolution();
+                _instance->bestSolutionPreprocessLayer = _instance->preprocessLayer;
+                LOG(V2_INFO, "CG: BC=%lu (initial)\n", _instance->bestCost);
+                coreGuided->run();
             }
-            // Initialize search procedure
-            searches.emplace_back(initializeSearchProcedure(c, i, searchStrats.size()));
-            searches.back()->setDescriptionLabelForNextCall("base-formula-" + std::to_string(updateLayer));
+        } else { // Old code from SIS
+            size_t nbSearchers = std::min((size_t)_params.maxSatNumSearchers(), (_instance->upperBound - _instance->lowerBound) + 1);
+            const int nbWorkers = _params.numWorkers() == -1 ? MyMpi::size(MPI_COMM_WORLD) : _params.numWorkers();
+            for (int i = 0; i < nbSearchers; i++) {
+                // Check if we have enough workers in the system for another job stream
+                if (nbWorkers <= searches.size()) {
+                    LOG(V1_WARN, "MAXSAT [WARN] Truncating number of parallel search strategies to %i due to lack of workers\n",
+                        nbWorkers);
+                    break;
+                }
+                // Initialize search procedure
+                searches.emplace_back(initializeSearchProcedure('d', i, *_instance));
+                searches.back()->setDescriptionLabelForNextCall("base-formula-" + std::to_string(updateLayer));
 
-            // While everybody uses their own encoder, we can put all of them in the same cross-sharing group
-            // due to the consistent naming of variables across all encoders.
-            searches.back()->setGroupId("consistent-logic-" + std::to_string(updateLayer)/*, 1, _instance->nbVars*/);
-
-            if (writer) searches.back()->setSolutionWriter(writer);
-        }
-        assert(!searches.empty());
-
-        // In some cases, it makes sense to first perform a solving attempt without constraints.
-        const bool noSolutionPresent = _instance->bestCost == ULONG_MAX;
-        const bool firstSolveWithoutBounds = _encoding_strat == MaxSatSearchProcedure::VIRTUAL
-            || _instance->objective.empty() || noSolutionPresent;
-        if (firstSolveWithoutBounds) {
-            // Initial SAT call: just solve the hard clauses.
-            // We just use the first specified search strategy for this task.
-            MaxSatSearchProcedure* search = searches.front().get();
-            // Only for this initial solve call, we don't need to enforce a bound first.
-            int resultCode = search->solveBlocking(); // solve and wait for a result
-            if (resultCode == RESULT_UNSAT) {
-                // UNSAT in the initial call
-                LOG(V2_INFO, "MAXSAT Problem is utterly unsatisfiable\n");
-                // Return an UNSAT result.
-                r.result = RESULT_UNSAT;
-                return r;
+                // While everybody uses their own encoder, we can put all of them in the same cross-sharing group
+                // due to the consistent naming of variables across all encoders.
+                searches.back()->setGroupId("consistent-logic-" + std::to_string(updateLayer) /*, 1, _instance->nbVars*/);
+                if (writer) searches.back()->setSolutionWriter(writer);
             }
-            if (resultCode != RESULT_SAT) {
-                // UNKNOWN or something else - an error in this case since we didn't cancel the job
-                LOG(V1_WARN, "[WARN] MAXSAT Unexpected result code %i\n", resultCode);
-                return r;
-            }
-            // Initial formula is SATisfiable.
-            LOG(V2_INFO, "MAXSAT Initial model has cost %lu\n", _instance->bestCost);
-        }
+            assert(!searches.empty());
 
-        if (_instance->objective.empty() || _encoding_strat == MaxSatSearchProcedure::VIRTUAL
+            // In some cases, it makes sense to first perform a solving attempt without constraints.
+            const bool noSolutionPresent = _instance->bestCost == ULONG_MAX;
+            const bool firstSolveWithoutBounds = _encoding_strat == MaxSatSearchProcedure::VIRTUAL
+                || _instance->objective.empty() || noSolutionPresent;
+            if (firstSolveWithoutBounds) {
+                // Initial SAT call: just solve the hard clauses.
+                // We just use the first specified search strategy for this task.
+                MaxSatSearchProcedure* search = searches.front().get();
+                // Only for this initial solve call, we don't need to enforce a bound first.
+                int resultCode = search->solveBlocking(); // solve and wait for a result
+                if (resultCode == RESULT_UNSAT) {
+                    // UNSAT in the initial call
+                    LOG(V2_INFO, "MAXSAT Problem is utterly unsatisfiable\n");
+                    // Return an UNSAT result.
+                    r.result = RESULT_UNSAT;
+                    return r;
+                }
+                if (resultCode != RESULT_SAT) {
+                    // UNKNOWN or something else - an error in this case since we didn't cancel the job
+                    LOG(V1_WARN, "[WARN] MAXSAT Unexpected result code %i\n", resultCode);
+                    return r;
+                }
+                // Initial formula is SATisfiable.
+                LOG(V2_INFO, "MAXSAT Initial model has cost %lu\n", _instance->bestCost);
+                LOG(V2_INFO, "CG: BC=%lu (initial)\n", _instance->bestCost); // Same output format!
+            }
+
+            if (_instance->objective.empty() || _encoding_strat == MaxSatSearchProcedure::VIRTUAL
                 || _instance->lowerBound == _instance->bestCost) {
-            // the solution is already proven optimal
-            r.result = RESULT_OPTIMUM_FOUND;
-            r.setSolution(reconstructSolutionToOriginalProblem(false));
-            LOG(V2_INFO, "MAXSAT OPTIMAL COST %lu\n", _instance->bestCost);
-            Logger::getMainInstance().flush();
-            return r;
-        } else if (firstSolveWithoutBounds) {
-            // Recount the solution cost to get the most accurate possible bound
-            (void) reconstructSolutionToOriginalProblem(true);
-        }
+                // the solution is already proven optimal
+                r.result = RESULT_OPTIMUM_FOUND;
+                r.setSolution(reconstructSolutionToOriginalProblem(false));
+                LOG(V2_INFO, "MAXSAT OPTIMAL COST %lu\n", _instance->bestCost);
+                Logger::getMainInstance().flush();
+                return r;
+            } else if (firstSolveWithoutBounds) {
+                // Recount the solution cost to get the most accurate possible bound
+                (void) reconstructSolutionToOriginalProblem(true);
+            }
 
-        // Run the initial formula revision through ALL searches, so that everyone has the same one.
-        if (searches.size() > 1) for (auto& search : searches) {
-            if (firstSolveWithoutBounds && search == searches.front())
-                continue; // this search has already been run once
-            search->solveNonblocking();
-            search->interrupt();
-        }
+            // Run the initial formula revision through ALL searches, so that everyone has the same one.
+            if (searches.size() > 1) for (auto& search : searches) {
+                if (firstSolveWithoutBounds && search == searches.front())
+                    continue; // this search has already been run once
+                search->solveNonblocking();
+                search->interrupt();
+            }
 
-        // Initialize interval search if needed
-        if (_instance->intervalSearch) {
-            // As the "max cost to test", use either the best known upper bound or,
-            // if we have a "constructive" upper bound, the best known cost minus one
-            _instance->intervalSearch->init(_instance->lowerBound,
-                std::min(_instance->upperBound, _instance->bestCost-1));
+            // Initialize interval search if needed
+            if (_instance->intervalSearch) {
+                // As the "max cost to test", use either the best known upper bound or,
+                // if we have a "constructive" upper bound, the best known cost minus one
+                _instance->intervalSearch->init(_instance->lowerBound,
+                    std::min(_instance->upperBound, _instance->bestCost-1));
+            }
         }
 
         // Main loop for solution improving search.
         std::list<std::unique_ptr<MaxSatSearchProcedure>> searchesToFinalize;
         bool changeSinceLastFocus = true;
         float timeOfLastChange = Timer::elapsedSeconds();
-        while (!isTimeoutHit() && _instance->lowerBound < _instance->bestCost && !searches.empty()) {
+
+
+        bool firstLaunched = false;
+        int last_progress_encoded_cost = 0;
+        auto last_progress_at = std::chrono::high_resolution_clock::now();
+        bool focus = false;
+
+        while (!isTimeoutHit() && _instance->lowerBound < _instance->bestCost /*&& !searches.empty()*/) {
+            if (_params.maxSatCoreGuided()) {
+                // Handle new reformulated instance
+                if (!focus && coreGuided->_new_reformulated_available) {
+                    reformulatedInstances.push_back(coreGuided->getReformulatedInstance());
+                    auto& new_instance = *reformulatedInstances.back(); 
+                    new_instance.intervalSearch->init(new_instance.lowerBound, std::min(new_instance.upperBound, new_instance.bestCost-1));     
+
+                    bool launched = false;
+                    int launches = (firstLaunched ? _params.maxSatCoreGuidedLaunches() : _params.maxSatCoreGuidedFirstLaunches());
+                    for (int i = 0; i < launches; i++) {
+                        if (searches.size() >= _params.maxSatNumSearchers() && _params.maxSatCoreGuidedKillRedundant()) {
+                            killMostRedundant(searches, searchesToFinalize);
+                        }
+                        if (searches.size() < _params.maxSatNumSearchers()) {
+                            LOG(V2_INFO, "CG: Starting new SIS search at encoded cost %lu \n",  reformulatedInstances.back()->encodedCost);
+                            searches.emplace_back(initializeSearchProcedure('d', i, new_instance));
+                            searches.back()->setDescriptionLabelForNextCall("formula-" + std::to_string(updateLayer) + "-" + std::to_string(new_instance.encodedCost) + "-" + std::to_string(i));
+                            searches.back()->setGroupId("consistent-logic-" + std::to_string(updateLayer) + "-"  + std::to_String(new_instance.encodedCost), 1, _instance->nbVars);
+                            launched = true;
+                            firstLaunched = true;
+                        }
+                    }
+                    // Delete the formula after it has been saved to lits_to_add
+                    new_instance.formula.clear();
+                    if (!launched) {
+                        reformulatedInstances.pop_back();
+                    }
+                }
+
+                // core-guided lower bound => global lower bound
+                auto alt = coreGuided->getEncodedCost();
+                if (alt > _instance->lowerBound) {
+                    LOG(V2_INFO, "CG: LB=%lu (CG)\n", alt);
+                    _instance->lowerBound = alt;
+                }
+
+                // core-guided SAT solution => global upper bound & best cost
+                alt = coreGuided->getBestGlobalCost();
+                if (alt < _instance->upperBound) {
+                    LOG(V2_INFO, "CG: UB=%lu (CG)\n", alt);
+                    _instance->upperBound = alt;
+                }
+                if (alt < _instance->bestCost) {
+                    LOG(V2_INFO, "CG: BC=%lu (CG)\n", alt);
+                    _instance->bestCost = alt;
+                    _instance->bestSolution = coreGuided->getBestGlobalSolution();
+                    _instance->bestSolutionPreprocessLayer = _instance->preprocessLayer;
+                    last_progress_at = std::chrono::high_resolution_clock::now();
+                }
+
+                for (auto& reformulatedInstance : reformulatedInstances) { // first update global state
+                    // local => global upper bound
+                    alt = reformulatedInstance->upperBound + reformulatedInstance->encodedCost;
+                    if (alt < _instance->upperBound) {
+                        LOG(V2_INFO, "CG: UB=%lu (REFORMULATED %d)\n", alt, reformulatedInstance->encodedCost);
+                        _instance->upperBound = alt;
+                    }
+               
+                    // local => global lower bound
+                    alt = reformulatedInstance->lowerBound + reformulatedInstance->encodedCost;
+                    if (alt > _instance->lowerBound) {
+                        LOG(V2_INFO, "CG: LB=%lu (REFORMULATED %d)\n", alt, reformulatedInstance->encodedCost);
+                        _instance->lowerBound = alt;
+                    }
+
+                    // local solution => global solution
+                    alt = reformulatedInstance->bestCost + reformulatedInstance->encodedCost;
+                    if (alt < _instance->bestCost && reformulatedInstance->bestCost != ULONG_MAX) {
+                        LOG(V2_INFO, "CG: BC=%lu (REFORMULATED %d)\n", alt, reformulatedInstance->encodedCost);
+                        _instance->bestCost = alt;
+                        _instance->bestSolution = reformulatedInstance->bestSolution;
+                        _instance->bestSolution.resize(_instance->nbVars+1);
+                        _instance->bestSolutionPreprocessLayer = _instance->preprocessLayer;
+                        last_progress_encoded_cost = reformulatedInstance->encodedCost;
+                        last_progress_at = std::chrono::high_resolution_clock::now();
+                    }
+
+                    // Normally local lb => global not possible, but tight bounds optimal!
+                    if (reformulatedInstance->lowerBound == reformulatedInstance->upperBound) {
+                        _instance->lowerBound = reformulatedInstance->lowerBound + reformulatedInstance->encodedCost;
+                        _instance->upperBound = reformulatedInstance->upperBound + reformulatedInstance->encodedCost;
+                    }
+                }
+
+                for (auto& reformulatedInstance : reformulatedInstances) { // and then locals
+                    // core-guided lower bound => local lower bound
+                    alt = coreGuided->getEncodedCost() - reformulatedInstance->encodedCost;
+                    if (alt > reformulatedInstance->lowerBound) {
+                        LOG(V3_VERB, "CG: local LB=%lu (CG for SIS %u)\n", alt, reformulatedInstance->encodedCost);
+                        reformulatedInstance->lowerBound = alt;
+                        reformulatedInstance->intervalSearch->stopTestingAndUpdateLower(alt-1); // UNSAT @ alt-1
+                    }
+
+                    // global => local upper bound
+                    alt = _instance->upperBound - reformulatedInstance->encodedCost;
+                    if (alt < reformulatedInstance->upperBound) {
+                        LOG(V3_VERB, "CG: local UB=%lu (global for SIS %u)\n", alt, reformulatedInstance->encodedCost);
+                        reformulatedInstance->upperBound = alt;
+                        reformulatedInstance->intervalSearch->stopTestingAndUpdateUpper(ULONG_MAX, alt+1); // SAT @ alt+1
+                    }
+
+                    // global => local best cost
+                    alt = _instance->bestCost - reformulatedInstance->encodedCost;
+                    if (alt < reformulatedInstance->bestCost) {
+                        LOG(V3_VERB, "CG: local BC=%lu (global for SIS %u)\n", alt, reformulatedInstance->encodedCost);
+                        reformulatedInstance->bestCost = alt;
+                        reformulatedInstance->intervalSearch->stopTestingAndUpdateUpper(ULONG_MAX, alt); // SAT @ alt
+                    }
+
+                    for (auto& second : reformulatedInstances) {
+                        // local lower bound of later SIS => local lower bound of earlier SIS
+                        if (second->encodedCost > reformulatedInstance->encodedCost) {
+                            alt = second->lowerBound + second->encodedCost - reformulatedInstance->encodedCost;
+                            if (alt > reformulatedInstance->lowerBound) {
+                                LOG(V3_VERB, "CG: local LB=%lu (SIS %u for SIS %u)\n", alt, second->encodedCost, reformulatedInstance->encodedCost);
+                                reformulatedInstance->lowerBound = alt;
+                                reformulatedInstance->intervalSearch->stopTestingAndUpdateLower(alt-1); // UNSAT @ alt-1
+                            }
+                        }
+                    }
+                }
+            }
+
             // Loop over all search strategies
             bool change = false;
             bool stagnation = false;
-            for (auto it = searches.begin(); it != searches.end(); ++it) {
+            for (auto it = searches.begin(); it != searches.end(); ) {
                 auto& search = *it;
                 // In a solve call right now?
                 if (!search->isIdle() && !search->isEncoding()) {
@@ -254,13 +399,31 @@ public:
                         // This search procedure does not want to continue: stop and remove it.
                         // But make sure not to delete the only remaining search this way.
                         if (searches.size() == 1) {
+                            if (_params.maxSatCoreGuided()) { // just reset the interval search
+                                LOG(V2_INFO, "CG: Preventing stagnation (reiniting intervalSearch)\n");
+                                for (auto& reformulatedInstance : reformulatedInstances) {
+                                    if (reformulatedInstance->lowerBound == reformulatedInstance->upperBound) {
+                                        LOG(V2_INFO, "CG: Optimal solution found, good stagnation\n");
+                                        _instance->lowerBound = reformulatedInstance->lowerBound + reformulatedInstance->encodedCost;
+                                        _instance->upperBound = reformulatedInstance->upperBound + reformulatedInstance->encodedCost;
+                                        break;
+                                    }
+                                    reformulatedInstance->intervalSearch->init(reformulatedInstance->lowerBound, min(reformulatedInstance->upperBound, reformulatedInstance->bestCost-1));
+                                }
+                                if (search->enforceNextBound()) {
+                                    LOG(V2_INFO, "CG: Succesfully prevented stagnation\n");
+                                    continue;
+                                } else {
+                                    LOG(V2_INFO, "CG: Failed to prevent stagnation\n");
+                                }
+                            }
                             stagnation = true;
                             break;
                         }
+                        LOG(V2_INFO, "CG: Finalizing SIS %lu\n", search->getEncodedCost());
                         searchesToFinalize.emplace_back();
                         std::swap(search, searchesToFinalize.back());
                         it = searches.erase(it);
-                        --it;
                         continue;
                     }
                 }
@@ -269,33 +432,76 @@ public:
                     search->solveNonblocking();
                     change = true;
                 }
+                ++it;
             }
-            if (stagnation || _instance->lowerBound >= _instance->bestCost)
+            
+            if (stagnation) break;
+            if (_instance->lowerBound >= _instance->bestCost)
                 break;
-
-            // Wait a bit if nothing changed
-            if (change) {
-                changeSinceLastFocus = true;
-                timeOfLastChange = Timer::elapsedSeconds();
-            } else {
-                usleep(1000); // 1 ms
-                if (_params.maxSatFocusPeriod() > 0 && Timer::elapsedSeconds() - timeOfLastChange > _params.maxSatFocusPeriod()
-                        && searches.size() > _params.maxSatFocusMin() && changeSinceLastFocus) {
-                    // cancel the searcher at the lowest bound
-                    MaxSatSearchProcedure* lowest {nullptr};
+            
+            // Focusing the search after 30 s 
+            if (_params.maxSatCoreGuided()) {
+                auto period = _params.maxSatCoreGuidedFocusPeriod()*1000;
+                auto now = std::chrono::high_resolution_clock::now();
+                if (!focus && period && std::chrono::duration_cast<std::chrono::milliseconds>(now - last_progress_at).count() > period) {
+                    bool highest_found = false;
+                    size_t highest = 0;
                     for (auto& search : searches) {
-                        if (search->isNonblockingSolvePending() &&
-                            (!lowest || search->getCurrentBound() < lowest->getCurrentBound())) {
-                            lowest = search.get();
+                        if (search->getEncodedCost() == last_progress_encoded_cost) {
+                            highest = max(highest, search->getCurrentBound());
+                            highest_found = true;
                         }
                     }
-                    if (lowest) {
-                        LOG(V2_INFO, "MAXSAT focus: cancel search at bound %lu\n", lowest->getCurrentBound());
-                        lowest->interrupt(true);
-                        // make sure that some time elapses AND some change was observed (interrupt!)
-                        // before allowing for the next focusing
-                        changeSinceLastFocus = false;
-                        timeOfLastChange = Timer::elapsedSeconds();
+                    assert(highest_found);
+                    LOG(V2_INFO, "CG: Focusing only on SIS %lu and bound %lu\n", last_progress_encoded_cost, highest);
+
+                    for (auto it = searches.begin(); it != searches.end(); ) {
+                        auto& search = *it;
+                        if (search->getEncodedCost() != last_progress_encoded_cost || search->getCurrentBound() != highest) {
+                            LOG(V2_INFO, "CG: Terminating SIS %lu with bound %lu\n", search->getEncodedCost(), search->getCurrentBound());
+                            if (!search->isIdle() && !search->isEncoding()) {
+                                search->interrupt();
+                            }
+                            searchesToFinalize.emplace_back();
+                            std::swap(search, searchesToFinalize.back());
+                            it = searches.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                    LOG(V2_INFO, "CG: Reinitializing interval search to include also possibly terminated bounds\n");
+                    for (auto& reformulatedInstance : reformulatedInstances) {
+                        reformulatedInstance->intervalSearch->init(reformulatedInstance->lowerBound, min(reformulatedInstance->upperBound, reformulatedInstance->bestCost-1));
+                    }
+                    LOG(V2_INFO, "CG: Search count: %lu\n", searches.size());
+                    assert(searches.size());
+                    focus = true;
+                }
+            } else {
+                // Wait a bit if nothing changed
+                if (change) {
+                    changeSinceLastFocus = true;
+                    timeOfLastChange = Timer::elapsedSeconds();
+                } else {
+                    usleep(1000); // 1 ms
+                    if (_params.maxSatFocusPeriod() > 0 && Timer::elapsedSeconds() - timeOfLastChange > _params.maxSatFocusPeriod()
+                            && searches.size() > _params.maxSatFocusMin() && changeSinceLastFocus) {
+                        // cancel the searcher at the lowest bound
+                        MaxSatSearchProcedure* lowest {nullptr};
+                        for (auto& search : searches) {
+                            if (search->isNonblockingSolvePending() &&
+                                (!lowest || search->getCurrentBound() < lowest->getCurrentBound())) {
+                                lowest = search.get();
+                            }
+                        }
+                        if (lowest) {
+                            LOG(V2_INFO, "MAXSAT focus: cancel search at bound %lu\n", lowest->getCurrentBound());
+                            lowest->interrupt(true);
+                            // make sure that some time elapses AND some change was observed (interrupt!)
+                            // before allowing for the next focusing
+                            changeSinceLastFocus = false;
+                            timeOfLastChange = Timer::elapsedSeconds();
+                        }
                     }
                 }
             }
@@ -337,6 +543,9 @@ public:
                         for (auto& search : searches) searchesToFinalize.push_back(std::move(search));
                         searches.clear();
                         while (!searchesToFinalize.empty()) tryDeleteOldSearches(searchesToFinalize);
+                        if (coreGuided) {
+                            coreGuided->_interrupt = true;
+                        }
                         // update
                         updateInstance(_instance_update); // nukes and rewrites instance
                         // try again on updated instance
@@ -350,6 +559,9 @@ public:
                 }
             }
 #endif
+        }
+        if (coreGuided) {
+            coreGuided->_interrupt = true;
         }
 
         LOG(V4_VVER, "MAXSAT trying to stop all searches ...\n");
@@ -373,12 +585,18 @@ public:
                 LOG(V2_INFO, "MAXSAT final SAT call to find solution of optimal cost %lu ...\n", _instance->upperBound);
                 assert(!searches.empty());
                 auto& search = searches.front();
-                bool ok = search->enforceNextBound(_instance->upperBound);
+                bool ok = search->enforceNextBound(_instance->upperBound - search->getEncodedCost());
                 assert(ok);
                 while (!search->isDoneEncoding()) usleep(1000);
                 int resultCode = search->solveBlocking(); // could still be cancelled
                 if (resultCode == SAT) {
-                    assert(_instance->bestCost == _instance->upperBound);
+                    assert(_instance->upperBound == search->getInstance().bestCost + search->getEncodedCost());
+                    LOG(V2_INFO, "CG: BC=%lu (REFORMULATED %d)\n", _instance->upperBound, search->getEncodedCost());
+                    _instance->bestCost = _instance->upperBound;
+                    _instance->bestSolution = search->getInstance().bestSolution;
+                    _instance->bestSolution.resize(_instance->nbVars+1);
+                    _instance->bestSolutionPreprocessLayer = _instance->preprocessLayer;
+                    
                     r.result = RESULT_OPTIMUM_FOUND;
                 }
                 LOG(V4_VVER, "MAXSAT once again trying to stop all searches ...\n");
@@ -470,7 +688,7 @@ private:
         case 0: {_encoding_strat = MaxSatSearchProcedure::WARNERS_ADDER; break;}
         case 1: {_encoding_strat = MaxSatSearchProcedure::DYNAMIC_POLYNOMIAL_WATCHDOG; break;}
         case 2: {_encoding_strat = MaxSatSearchProcedure::GENERALIZED_TOTALIZER; break;}
-        case 3: {_encoding_strat = pickCardinalityEncoding(); break;}
+        case 3: {_encoding_strat = pickCardinalityEncoding(*_instance); break;}
         case 4: {_encoding_strat = MaxSatSearchProcedure::VIRTUAL; break;}
         default: {_encoding_strat = MaxSatSearchProcedure::NONE; break;}
         }
@@ -519,7 +737,7 @@ private:
             update.lowerBound = parser->get_lb();
             update.upperBound = parser->get_ub();
             _update_result.instanceImproved = update.nbVars <= 0.9 * _instance->nbVars
-                || update.formula.size() <= 0.9 * _instance->formulaSize
+                || update.formula.size() <= 0.9 * _instance->formula.size()
                 || update.objective.size() <= 0.9 * _instance->objective.size();
             _maxpre_run_done = true;
         });
@@ -568,28 +786,28 @@ private:
 
     // Heuristic picking a suitable cardinality encoding based on the objective function's properties.
     // Obtained by a mix of educated guesses and 1-minute runs on MaxSAT Eval'23 instances.
-    MaxSatSearchProcedure::EncodingStrategy pickCardinalityEncoding() {
+    MaxSatSearchProcedure::EncodingStrategy pickCardinalityEncoding(const MaxSatInstance& instance) {
 
         // For really tiny objective functions, GTE should always be the cheapest and most direct option.
-        if (_instance->objective.size() <= 5) return MaxSatSearchProcedure::GENERALIZED_TOTALIZER;
+        if (instance.objective.size() <= 5) return MaxSatSearchProcedure::GENERALIZED_TOTALIZER;
 
         // Large objective function or very large sum of weights
         // or very large base formula with decently large objective: Fallback to Adder.
-        if (_instance->objective.size() > 10'000 || _instance->sumOfWeights > 1'000'000'000'000UL
-                || (_instance->formulaSize > 10'000'000 && _instance->objective.size() > 5'000))
+        if (instance.objective.size() > 10'000 || instance.sumOfWeights > 1'000'000'000'000UL
+                || (instance.formula.size() > 10'000'000 && instance.objective.size() > 5'000))
             return MaxSatSearchProcedure::WARNERS_ADDER;
 
         // Very small sum of weights, few unique weights, and a not too large problem
         // in terms of literals or objective terms: GTE can be used.
-        if (_instance->sumOfWeights <= 100 && _instance->nbUniqueWeights <= 20
-                && (_instance->formulaSize <= 10'000'000 || _instance->objective.size() <= 25))
+        if (instance.sumOfWeights <= 100 && instance.nbUniqueWeights <= 20
+                && (instance.formula.size() <= 10'000'000 || instance.objective.size() <= 25))
             return MaxSatSearchProcedure::GENERALIZED_TOTALIZER;
 
         // Otherwise, default case of DPW.
         return MaxSatSearchProcedure::DYNAMIC_POLYNOMIAL_WATCHDOG;
     }
 
-    MaxSatSearchProcedure* initializeSearchProcedure(char c, int index, int nbTotal) {
+    MaxSatSearchProcedure* initializeSearchProcedure(char c, int index, MaxSatInstance& instance) {
         // Parse search strategy
         MaxSatSearchProcedure::SearchStrategy searchStrat;
         std::string label = std::to_string(index) + ":";
@@ -612,8 +830,9 @@ private:
             break;
         }
         // Initialize search procedure
+        auto strat = _params.maxSatCoreGuided() ? pickCardinalityEncoding(instance) : _encoding_strat;
         auto p = new MaxSatSearchProcedure(_params, _api, _desc, _dtask_tracker,
-            *_instance, _encoding_strat, searchStrat, label);
+            instance, strat, searchStrat, label);
         return p;
     }
 
@@ -625,6 +844,46 @@ private:
         if (Terminator::isTerminating())
             return true;
         return false;
+    }
+
+    void killMostRedundant(
+        std::list<std::unique_ptr<MaxSatSearchProcedure>>& searches,
+        std::list<std::unique_ptr<MaxSatSearchProcedure>>& searchesToFinalize
+    ) {
+        std::vector<int> encodedCosts {}; // List & sort encoded costs
+        for (const auto& search : searches) {
+            encodedCosts.push_back(search->getEncodedCost());
+        }
+        std::sort(encodedCosts.begin(), encodedCosts.end());
+        assert(encodedCosts.size() > 1);
+
+        // Find the cost redundant encoded cost
+        size_t kill_cost = encodedCosts[1];
+        size_t smallest_gap = ULONG_MAX;
+        for (int j = 1; j < encodedCosts.size()-1; j++) {
+            auto gap = encodedCosts[j+1] - encodedCosts[j-1];
+            if (gap < smallest_gap) {
+                kill_cost = encodedCosts[j];
+                smallest_gap = gap;
+            }
+        }
+
+        // Kill one searcher
+        for (auto it = searches.begin(); it != searches.end(); ) {
+            auto& search = *it;
+            if (search->getEncodedCost() == kill_cost) {
+                if (!search->isIdle() && !search->isEncoding()) {
+                    search->interrupt();
+                }
+                searchesToFinalize.emplace_back();
+                std::swap(search, searchesToFinalize.back());
+                it = searches.erase(it);
+                LOG(V2_INFO, "CG: Killing SIS search at encoded cost %lu \n", kill_cost);
+                break;
+            } else {
+                ++it;
+            }
+        }
     }
 
     void tryStopAllSearches(std::list<std::unique_ptr<MaxSatSearchProcedure>>& searches) {
@@ -644,31 +903,32 @@ private:
     }
 
     void tryDeleteOldSearches(std::list<std::unique_ptr<MaxSatSearchProcedure>>& searchesToFinalize) {
-        for (auto it = searchesToFinalize.begin(); it != searchesToFinalize.end(); ++it) {
+        for (auto it = searchesToFinalize.begin(); it != searchesToFinalize.end(); ) {
             auto& search = *it;
             if (search->canBeFinalized()) {
                 search->finalize();
                 it = searchesToFinalize.erase(it);
-                --it;
+            } else {
+                ++it;
             }
         }
     }
 
     std::vector<int> reconstructSolutionToOriginalProblem(bool recountCost) {
-#if MALLOB_USE_MAXPRE == 1
-        auto parser = StaticMaxSatParserStore::get(_desc.getId());
         size_t cost = _instance->bestCost;
-        std::vector<int> sol = parser->reconstruct(_instance->bestSolution,
-            recountCost ? &cost : nullptr,
-            _instance->bestSolutionPreprocessLayer, true, 1);
-        if (recountCost) {
-            LOG(V2_INFO, "MAXSAT MAXPRE cost recount: %lu -> %lu\n", _instance->bestCost, cost);
-            _instance->bestCost = cost;
-            _instance->upperBound = std::min(_instance->upperBound, cost);
-        }
-#else
         std::vector<int> sol = _instance->bestSolution;
-        size_t cost = _instance->bestCost;
+#if MALLOB_USE_MAXPRE == 1
+        if (_params.maxPre()) {  
+            auto parser = StaticMaxSatParserStore::get(_desc.getId());
+            sol = parser->reconstruct(_instance->bestSolution,
+                recountCost ? &cost : nullptr,
+                _instance->bestSolutionPreprocessLayer, true, 1);
+            if (recountCost) {
+                LOG(V2_INFO, "MAXSAT MAXPRE cost recount: %lu -> %lu\n", _instance->bestCost, cost);
+                _instance->bestCost = cost;
+                _instance->upperBound = std::min(_instance->upperBound, cost);
+            }
+        }
 #endif
         sol[0] = sol.size();
         sol.resize(sol.size() + 2);

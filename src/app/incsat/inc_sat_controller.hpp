@@ -57,7 +57,7 @@ public:
     JobResult solveFromIncrementalFile(const std::string& problemFile) {
         _problem_file = problemFile;
         assert(!_stream);
-        initStream(false);
+        initStream(false, true);
 
         while (!isTimeoutHit(&_params, &_desc, _start_time)
                 && parseNextRevision()
@@ -79,12 +79,12 @@ public:
         return res;
     }
 
-    void initInteractiveSolving() {
+    void initInteractiveSolving(bool distributed=true) {
         if (_stream) return;
         if (_params.onTheFlyChecking())
             _problem_file = TmpDir::getMachineLocalTmpDir() + "/edu.kit.iti.mallob.incsattparse."
                 + std::to_string(_desc.getId()) + "." + std::to_string(_stream_id);
-        initStream(true);
+        initStream(true, distributed);
     }
 
     bool solveNextRevisionNonblocking(std::vector<int>&& clauses, std::vector<int>&& assumptions, const std::string& descLabel = "") {
@@ -150,13 +150,15 @@ public:
     }
 
 private:
-    void initStream(bool createProblemFileAsPipe) {
+    void initStream(bool createProblemFileAsPipe, bool distributed) {
         _start_time = Timer::elapsedSeconds();
         _stream.reset(new WrappedSatJobStream(_name));
-        _stream->mallobProcessor = new MallobSatJobStreamProcessor(_params, _api, _desc,
-            _name, _stream_id, true, _stream->stream.getSynchronizer());
-        _stream->mallobProcessor->setDTaskSlot(_dtask_tracker.createDTask());
-        _stream->stream.addProcessor(_stream->mallobProcessor);
+        if (distributed) {
+            _stream->mallobProcessor = new MallobSatJobStreamProcessor(_params, _api, _desc,
+                _name, _stream_id, true, _stream->stream.getSynchronizer());
+            _stream->mallobProcessor->setDTaskSlot(_dtask_tracker.createDTask());
+            _stream->stream.addProcessor(_stream->mallobProcessor);
+        }
 
         if (_params.internalStreamProcessor()) {
             SolverSetup setup;

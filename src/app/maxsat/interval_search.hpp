@@ -70,6 +70,7 @@ public:
 
     void init(size_t minToTest, size_t maxToTest) {
         // Create first interval with full weight
+        _current_bounds.clear();
         _current_bounds.push_back({minToTest, maxToTest, WEIGHT_SUM});
         _current_bounds.back().orphaned = true;
         print();
@@ -211,6 +212,12 @@ public:
         return bounds;
     }
     void print() const {
+        /*std::string bounds_out{};
+        for (auto i : _current_bounds) {
+            bounds_out += std::string(i.orphaned ? "~" : "") + "(" + std::to_string(i.lb) + ", " + std::to_string(i.ub) + ") ";
+        }
+        LOG(V2_INFO, "CG: Interval bounds: %s\n", bounds_out.c_str());*/
+
         std::string out;
         std::string density;
         double weightTotal = 0;

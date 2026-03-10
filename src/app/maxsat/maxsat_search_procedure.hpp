@@ -104,11 +104,11 @@ private:
 public:
     MaxSatSearchProcedure(const Parameters& params, APIConnector& api, JobDescription& desc, DTaskTracker& tracker,
             MaxSatInstance& instance, EncodingStrategy encStrat, SearchStrategy searchStrat, const std::string& label) :
-        _params(params), _api(api), _desc(desc), _instance(instance),
-        _lits_to_add(_instance.formulaData, _instance.formulaData+_instance.formulaSize),
+        _params(params), _api(api), _desc(desc), _instance(instance), _lits_to_add(instance.formula),
         _current_bound(ULONG_MAX), _encoding_strat(encStrat), _search_strat(searchStrat), _label(label) {
 
         _stream_wrapper.reset(new IncSatController(_params, _api, _desc, tracker));
+        _stream_wrapper->initInteractiveSolving();
 
         _nb_orig_vars = _instance.nbVars; // before cardinality constraint encodings!
 
@@ -142,6 +142,14 @@ public:
             specStr.erase(std::remove_if(specStr.begin(), specStr.end(), ::isspace), specStr.end());
             _stream_wrapper->getMallobProcessor()->setInnerObjective(specStr);
         }
+    }
+
+    size_t getEncodedCost() const {
+        return _instance.encodedCost;
+    }
+
+    const MaxSatInstance& getInstance() const {
+        return _instance;
     }
 
     void setSolutionWriter(std::shared_ptr<SolutionWriter> solutionWriter) {
@@ -211,6 +219,9 @@ public:
         LOG(V2_INFO, "MAXSAT %s Calling SAT %s (%i new lits, %i assumptions, chk %lu,%x)\n",
             _label.c_str(), _current_bound==ULONG_MAX ? "bound-free" : ("with bound " + std::to_string(_current_bound)).c_str(),
             _lits_to_add.size(), _assumptions_to_set.size(), hash.count(), hash.get());
+        if (_params.maxSatCoreGuided()) {
+            LOG(V2_INFO, "CG: TESTING BOUND %lu(+%lu=%lu)\n", _current_bound, _instance.encodedCost, _current_bound + _instance.encodedCost);
+        }
         if (_params.verbosity() >= V4_VVER) {
             LOG(V4_VVER, "MAXSAT Literals: %s\n", StringUtils::getSummary(_lits_to_add).c_str());
             LOG(V4_VVER, "MAXSAT Assumptions: %s\n", StringUtils::getSummary(_assumptions_to_set).c_str());
@@ -320,6 +331,9 @@ public:
             if (_instance.intervalSearch) {
                 _instance.intervalSearch->stopTestingAndUpdateUpper(_current_bound, cost);
             }
+            if (!_params.maxSatCoreGuided()) {
+                LOG(V2_INFO, "CG: BC=%lu (SIS)\n", cost); // Same output format!
+            }
         } else {
             LOG(V2_INFO, "MAXSAT %s Bound %lu solved with cost %lu - bounds unchanged\n",
                 _label.c_str(), _current_bound, _instance.bestCost);
@@ -349,6 +363,15 @@ public:
         // We allow some leniency here since it may be better to keep a job running
         // if its bound is only slightly suboptimal w.r.t. the best known cost.
         if (_current_bound > 1.01 * _instance.bestCost) return true;
+        // Case 3: A better bound has been found in some other search
+        if (_params.maxSatCoreGuided() && _current_bound >= _instance.bestCost) {
+            LOG(
+                V2_INFO, "CG: BOUND %lu(+%lu=%lu) IS OBSOLATE DUE TO NEW UB %lu(+%lu=%lu)\n",
+                _current_bound, _instance.encodedCost, _current_bound + _instance.encodedCost,
+                _instance.upperBound, _instance.encodedCost, _instance.upperBound + _instance.encodedCost
+            );
+            return true;   
+        }
         // Otherwise, the solving attempt is not obsolete.
         return false;
     }
